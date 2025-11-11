@@ -17,6 +17,7 @@
 #include <fstream>
 #include <getopt.h>
 #include <vector>
+#include <map>
 #include <algorithm>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -24,7 +25,9 @@
 #include <math.h>
 #include <limits.h>
 #include <iomanip>
-#include "api/BamReader.h"
+#include "htslib/sam.h"
+#include "htslib/hts.h"
+#include "htslib/faidx.h"
 #include "omp.h"
 
 //#define _DEBUG
@@ -32,10 +35,9 @@
 //#define _FASTA_DEBUG
 
 using namespace std;
-using namespace BamTools;
 
 
-const string VERSION = "GetBaseCountsMultiSample 1.2.5";
+const string VERSION = "GetBaseCountsCram 1.3.0";
 
 string input_fasta_file;
 map<string, string> input_bam_files;
@@ -72,6 +74,164 @@ int warning_overlapping_multimapped = 0;
 string maf_output_center = "msk";
 string maf_output_genome_build = "hg19";
 bool generic_counting = false;
+
+// Htslib wrapper structures and helper functions
+struct CigarOp {
+    char Type;
+    uint32_t Length;
+};
+
+class BamAlignment {
+public:
+    string Name;
+    int32_t Position;
+    uint16_t MapQuality;
+    string QueryBases;
+    string Qualities;
+    vector<CigarOp> CigarData;
+    uint16_t flag;
+    int32_t refID;
+    int32_t next_refID;
+    int32_t next_pos;
+    int32_t template_len;
+    
+    bool IsDuplicate() const { return (flag & BAM_FDUP) != 0; }
+    bool IsProperPair() const { return (flag & BAM_FPROPER_PAIR) != 0; }
+    bool IsFailedQC() const { return (flag & BAM_FQCFAIL) != 0; }
+    bool IsPrimaryAlignment() const { return (flag & BAM_FSECONDARY) == 0 && (flag & BAM_FSUPPLEMENTARY) == 0; }
+    bool IsReverseStrand() const { return (flag & BAM_FREVERSE) != 0; }
+    bool IsFirstMate() const { return (flag & BAM_FREAD1) != 0; }
+    
+    int32_t GetEndPosition(bool padded, bool closed_interval) const {
+        int32_t end_pos = Position;
+        for(size_t i = 0; i < CigarData.size(); i++) {
+            char op = CigarData[i].Type;
+            if(op == 'M' || op == 'D' || op == 'N' || op == '=' || op == 'X') {
+                end_pos += CigarData[i].Length;
+            }
+        }
+        return closed_interval ? end_pos : end_pos + 1;
+    }
+};
+
+class BamReader {
+private:
+    samFile* fp;
+    sam_hdr_t* header;  // Updated for htslib 1.22.1
+    hts_idx_t* idx;
+    hts_itr_t* iter;
+    bam1_t* b;
+    
+public:
+    BamReader() : fp(NULL), header(NULL), idx(NULL), iter(NULL), b(NULL) {
+        b = bam_init1();
+    }
+    
+    ~BamReader() {
+        Close();
+        if(b) bam_destroy1(b);
+    }
+    
+    bool Open(const string& filename) {
+        fp = sam_open(filename.c_str(), "r");
+        if(!fp) return false;
+        header = sam_hdr_read(fp);
+        if(!header) {
+            sam_close(fp);
+            fp = NULL;
+            return false;
+        }
+        return true;
+    }
+    
+    bool OpenIndex(const string& bam_filename) {
+        if(!fp) return false;
+        // htslib will automatically find .bai for BAM or .crai for CRAM
+        idx = sam_index_load(fp, bam_filename.c_str());
+        return idx != NULL;
+    }
+    
+    void Close() {
+        if(iter) { hts_itr_destroy(iter); iter = NULL; }
+        if(idx) { hts_idx_destroy(idx); idx = NULL; }
+        if(header) { sam_hdr_destroy(header); header = NULL; }
+        if(fp) { sam_close(fp); fp = NULL; }
+    }
+    
+    int GetReferenceID(const string& refname) {
+        if(!header) return -1;
+        return sam_hdr_name2tid(header, refname.c_str());  // Updated for htslib 1.22.1
+    }
+    
+    bool SetRegion(int refid1, int pos1, int refid2, int pos2) {
+        if(!idx || !header) return false;
+        if(iter) {
+            hts_itr_destroy(iter);
+            iter = NULL;
+        }
+        
+        if(refid1 == refid2) {
+            iter = sam_itr_queryi(idx, refid1, pos1, pos2);
+        } else {
+            // For multi-chromosome regions, we'll use the first chromosome region
+            // This matches bamtools behavior reasonably well
+            iter = sam_itr_queryi(idx, refid1, pos1, header->target_len[refid1]);
+        }
+        return iter != NULL;
+    }
+    
+    bool GetNextAlignment(BamAlignment& aln) {
+        if(!fp || !header) return false;
+        
+        int ret;
+        if(iter) {
+            ret = sam_itr_next(fp, iter, b);
+        } else {
+            ret = sam_read1(fp, header, b);
+        }
+        
+        if(ret < 0) return false;
+        
+        // Convert bam1_t to BamAlignment
+        aln.Name = string(bam_get_qname(b));
+        aln.Position = b->core.pos;
+        aln.MapQuality = b->core.qual;
+        aln.flag = b->core.flag;
+        aln.refID = b->core.tid;
+        aln.next_refID = b->core.mtid;
+        aln.next_pos = b->core.mpos;
+        aln.template_len = b->core.isize;
+        
+        // Get sequence
+        uint8_t* seq = bam_get_seq(b);
+        aln.QueryBases.clear();
+        aln.QueryBases.reserve(b->core.l_qseq);
+        for(int i = 0; i < b->core.l_qseq; i++) {
+            aln.QueryBases += seq_nt16_str[bam_seqi(seq, i)];
+        }
+        
+        // Get qualities
+        uint8_t* qual = bam_get_qual(b);
+        aln.Qualities.clear();
+        aln.Qualities.reserve(b->core.l_qseq);
+        for(int i = 0; i < b->core.l_qseq; i++) {
+            aln.Qualities += (char)(qual[i] + 33);
+        }
+        
+        // Get CIGAR
+        uint32_t* cigar = bam_get_cigar(b);
+        aln.CigarData.clear();
+        aln.CigarData.reserve(b->core.n_cigar);
+        for(uint32_t i = 0; i < b->core.n_cigar; i++) {
+            CigarOp op;
+            op.Length = bam_cigar_oplen(cigar[i]);
+            op.Type = bam_cigar_opchr(cigar[i]);
+            aln.CigarData.push_back(op);
+        }
+        
+        return true;
+    }
+};
 
 bool isNumber(const string& s)  //check if a string(chrom name) is number
 {
@@ -2116,18 +2276,15 @@ void getBaseCounts()
                 }
                 exit(1);
             }
-            string input_bam_index_file1 = it_bam->second.substr(0, it_bam->second.length() - 3) + "bai";
-            string input_bam_index_file2 = it_bam->second + ".bai";
-            if(!my_bam_reader.OpenIndex(input_bam_index_file1))
+            // htslib automatically finds .bai for BAM or .crai for CRAM
+            if(!my_bam_reader.OpenIndex(it_bam->second))
             {
-                if(!my_bam_reader.OpenIndex(input_bam_index_file2))
-                {
 #pragma omp critical(output_stderr)
-                    {
-                        cerr << "[ERROR] fail to open input bam index file: " << input_bam_index_file1 << ", or " << input_bam_index_file2 << endl;
-                    }
-                    exit(1);
+                {
+                    cerr << "[ERROR] fail to open index file for: " << it_bam->second << endl;
+                    cerr << "[ERROR] Please ensure .bai (for BAM) or .crai (for CRAM) index file exists" << endl;
                 }
+                exit(1);
             }
             while(variant_block_index < variant_block_vec.size())
             {
