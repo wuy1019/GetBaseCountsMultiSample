@@ -12,7 +12,7 @@ GetBaseCountsCram 是 GetBaseCountsMultiSample 的重构版本，使用 htslib �
 
 ## 依赖
 
-- htslib (>=1.9)
+- htslib (>=1.22.1)
 - gcc/g++ 支持 C++11
 - OpenMP 支持
 
@@ -22,12 +22,12 @@ GetBaseCountsCram 是 GetBaseCountsMultiSample 的重构版本，使用 htslib �
 
 ```bash
 # 下载并编译 htslib
-wget https://github.com/samtools/htslib/releases/download/1.17/htslib-1.17.tar.bz2
-tar -xjf htslib-1.17.tar.bz2
-cd htslib-1.17
+wget https://github.com/samtools/htslib/releases/download/1.22.1/htslib-1.22.1.tar.bz2
+tar -xjf htslib-1.22.1.tar.bz2
+cd htslib-1.22.1
 ./configure --disable-libcurl --disable-s3 --disable-gcs
 make
-sudo make install
+make install
 ```
 
 ### 2. 编译 GetBaseCountsCram
